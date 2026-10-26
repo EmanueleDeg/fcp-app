@@ -1030,6 +1030,23 @@ function resolveBt(bt){ return BT_MAP[bt]||bt; }
 // SPECIE_DB — Score per specie specifica (portato da FcPMap_v4)
 // Ogni specie ha scoreZona() che usa z.idx come base + fattori specie
 // ═══════════════════════════════════════════════════════════════════
+// ── Taper fine-stagione × quota (edulis/pinophilus) — stessi valori dell'app ──
+// Ottobre: >1800 ×0.60 | 1500-1800 ×0.80 | 1200-1500 ×0.90 | <1200 ×1.0
+// Novembre: >1400 ×0.35 | 800-1400 ×0.55 | <800 ×0.70
+// z.idx = max tra le specie: se arriva già da edulis/pinophilus include il taper del mese corrente
+// (via seasonFactor) → qui si applica solo il rapporto taper(mese)/taper(corrente), niente doppio conteggio.
+function _taperForZone(z, month, alt){
+  const t=lateSeasonTaper(month,alt);
+  if(z && (z.idxSrc==='edulis'||z.idxSrc==='pinophilus')){
+    return t/lateSeasonTaper(new Date().getMonth()+1,alt);
+  }
+  return t;
+}
+function lateSeasonTaper(month, alt){
+  if(month===10) return alt>1800?0.60:alt>=1500?0.80:alt>=1200?0.90:1.0;
+  if(month===11) return alt>1400?0.35:alt>=800?0.55:0.70;
+  return 1.0;
+}
 const SPECIE_DB = {
 
   edulis: {
@@ -1049,11 +1066,11 @@ const SPECIE_DB = {
       if(alt>=700&&alt<=1700) score=Math.min(100,Math.round(score*1.10));
       else if(alt<400) score=Math.round(score*.25);
       else if(alt<600) score=Math.round(score*.55);
-      const SF={1:.04,2:.04,3:.08,4:.10,5:.25,6:.40,7:.60,8:.72,9:1.00,10:1.00,11:.45,12:.10};
+      const SF={1:.04,2:.04,3:.08,4:.10,5:.25,6:.40,7:.60,8:.72,9:1.00,10:.95,11:.45,12:.10};
       const sf=SF[month]??.04;
       let bonus=1.0;
       if([7,8].includes(month)&&alt>=1000&&['faggio','misto_nobile','abete_rosso'].includes(btN)) bonus=1.12;
-      return Math.min(100,Math.max(0,Math.round(score*sf*bonus)));
+      return Math.min(100,Math.max(0,Math.round(score*sf*bonus*_taperForZone(z,month,alt))));
     }
   },
 
@@ -1081,7 +1098,7 @@ const SPECIE_DB = {
       let bonus=1.0;
       if([4,5].includes(month)&&alt>=800&&['abete_rosso','pino','abete_bianco','misto_nobile'].includes(btN)) bonus=1.12;
       else if([4,5].includes(month)&&alt>=900&&['faggio','castagno'].includes(btN)) bonus=1.06;
-      return Math.min(100,Math.max(0,Math.round(score*sf*bonus)));
+      return Math.min(100,Math.max(0,Math.round(score*sf*bonus*_taperForZone(z,month,alt))));
     }
   },
 
@@ -1298,7 +1315,7 @@ function seasonFactor(month, specie, bosco, quota){
       if(["faggio","castagno"].includes(btR))
         base=Math.min(1.0,base+0.05);
     }
-    return base;
+    return base*lateSeasonTaper(month,quota);   // fine stagione × quota
   }
 
   const p=SPECIES_PARAMS[specie]||SPECIES_PARAMS.edulis;
@@ -1308,11 +1325,12 @@ function seasonFactor(month, specie, bosco, quota){
     if(p.boschi_ottimali.includes(btR)&&quota>=600) base=Math.min(1.0,base+0.15);
     else if(p.boschi_buoni.includes(btR)&&quota>=500) base=Math.min(1.0,base+0.08);
   }
+  if(specie==="edulis") base*=lateSeasonTaper(month,quota);   // fine stagione × quota
   return base;
 }
 
 // ── fcp_score_specie ─────────────────────────────────────────────
-function fcpScoreSpecie(specie, r15, r3, tAvg, tMax, tMin, hum, wind, soilMoist, rainLagDays, bosco, quota, month, esp, r30){
+function fcpScoreSpecie(specie, r15, r3, tAvg, tMax, tMin, hum, wind, soilMoist, rainLagDays, bosco, quota, month, esp, r30, tMin7){
   const btR=resolveBt(bosco);
   const sRain=rainScore(r15,r3,specie);
   const sTemp=tempScore(tAvg,tMax,tMin,specie);
@@ -1320,18 +1338,39 @@ function fcpScoreSpecie(specie, r15, r3, tAvg, tMax, tMin, hum, wind, soilMoist,
   const sBosco=boscoScore(btR,quota,specie);
   const sHum=humScore(hum);
   const sEsp=esp==="N"?5:esp==="M"?2:0;
-  const raw=sRain+sTemp+sSoil+sBosco+sHum+sEsp;
+  // Pavimento "sempre attivo" (bosco + temperatura + umidità aria + esposizione) ridotto al 85%:
+  // con condizioni scarse l'indice scende sotto 40 e 90-100 diventa raro.
+  const FLOOR_K=0.85;
+  const raw=sRain+sSoil+(sTemp+sBosco+sHum+sEsp)*FLOOR_K;
   const sf=seasonFactor(month,specie,btR,quota);
   const rlf=rainLagFactor(rainLagDays,specie);
   const wp=windPenalty(wind);
   const wrf=waterReserveFactor(r30);   // v3.3 — riserva idrica 30 gg
-  return Math.min(100,Math.max(0,Math.round(raw*sf*rlf*wp*wrf)));
+  const base=Math.min(100,Math.max(0,raw*sf*rlf*wp*wrf));
+  // ── Moltiplicatori conservativi (stessi dell'app) ──
+  // Gelo: minima tMin degli ultimi ~7gg (assente → nessun effetto)
+  let frostFactor=1.0;
+  if(tMin7!=null && isFinite(tMin7)){
+    frostFactor = tMin7<=-2?0.35 : tMin7<=0?0.50 : tMin7<=3?0.72 : tMin7<=5?0.88 : 1.0;
+  }
+  // Cancello siccità: pioggia 15gg
+  const dryGate = r15<15?0.40 : r15<25?0.70 : 1.0;
+  // Buttata passata (edulis/pinophilus): riserva vecchia (gg16-30) ma ultime 2 settimane secche e nessuna pioggia recente
+  let flushPast=1.0;
+  if((specie==="edulis"||specie==="pinophilus") && r30!=null){
+    const r16_30=r30-r15, r4_15=r15-r3;
+    if(r16_30>50 && r4_15<15 && r3<8) flushPast=0.60;
+  }
+  const lateSeasonAlt=(specie==="edulis"||specie==="pinophilus")?lateSeasonTaper(month,quota):1.0;   // già incluso in sf
+  fcpScoreSpecie.last={base:Math.round(base*10)/10, frostFactor, dryGate, lateSeasonAlt, flushPast,
+    rlf:Math.round(rlf*100)/100, tMin7:(tMin7!=null&&isFinite(tMin7))?Math.round(tMin7*10)/10:null, r15:Math.round(r15*10)/10};
+  return Math.min(100,Math.max(0,Math.round(base*frostFactor*dryGate*flushPast)));
 }
 
 // ── fcpV2 — funzione principale compatibile con il resto del codice ──
 // Calcola score per tutte le specie e restituisce il massimo
 // con breakdown dettagliato
-function fcpV2(r15,r3,tAvg,tMax,tMin,hum,wind,month,bt,altStr,esp,soilMoist,rainLagDays,r30){
+function fcpV2(r15,r3,tAvg,tMax,tMin,hum,wind,month,bt,altStr,esp,soilMoist,rainLagDays,r30,tMin7){
   const quota=parseInt(altStr)||800;
   const btR=resolveBt(bt);
   // Default rain lag: se non disponibile usa 8 giorni (finestra ottimale)
@@ -1339,15 +1378,13 @@ function fcpV2(r15,r3,tAvg,tMax,tMin,hum,wind,month,bt,altStr,esp,soilMoist,rain
   // v3.3 — se r30 non arriva, stima prudenziale = r15 * 1.6
   const rr30 = (r30!=null && !isNaN(r30)) ? r30 : (r15!=null ? r15*1.6 : null);
 
-  const scores={
-    edulis:     fcpScoreSpecie("edulis",    r15,r3,tAvg,tMax,tMin,hum,wind,soilMoist,lag,bt,quota,month,esp,rr30),
-    pinophilus: fcpScoreSpecie("pinophilus",r15,r3,tAvg,tMax,tMin,hum,wind,soilMoist,lag,bt,quota,month,esp,rr30),
-    aestivalis: fcpScoreSpecie("aestivalis",r15,r3,tAvg,tMax,tMin,hum,wind,soilMoist,lag,bt,quota,month,esp,rr30),
-    aereus:     fcpScoreSpecie("aereus",    r15,r3,tAvg,tMax,tMin,hum,wind,soilMoist,lag,bt,quota,month,esp,rr30),
-  };
+  const dbg={};
+  const _sc=(sp)=>{ const v=fcpScoreSpecie(sp,r15,r3,tAvg,tMax,tMin,hum,wind,soilMoist,lag,bt,quota,month,esp,rr30,tMin7); dbg[sp]={...fcpScoreSpecie.last,final:v}; return v; };
+  const scores={ edulis:_sc("edulis"), pinophilus:_sc("pinophilus"), aestivalis:_sc("aestivalis"), aereus:_sc("aereus") };
 
   // Indice principale = max tra le specie
   const total=Math.max(...Object.values(scores));
+  const src=Object.keys(scores).find(k=>scores[k]===total);   // specie che guida l'indice
 
   // Dettaglio breakdown per display
   const sRain=rainScore(r15,r3,"edulis");
@@ -1361,7 +1398,7 @@ function fcpV2(r15,r3,tAvg,tMax,tMin,hum,wind,month,bt,altStr,esp,soilMoist,rain
   const wp=windPenalty(wind);
   const wrf=waterReserveFactor(rr30);
 
-  return {total, scores, wrf:Math.round(wrf*100)/100, bd_scores:[
+  return {total, scores, src, dbg, wrf:Math.round(wrf*100)/100, bd_scores:[
     {l:"🌧️ Pioggia 15 giorni",   s:Math.round(sRain*0.6), m:25},
     {l:"🌧️ Pioggia trigger 3gg", s:Math.round(sRain*0.4), m:15},
     {l:"🌡️ Temperatura",         s:Math.round(sTemp),     m:20},
@@ -1377,15 +1414,15 @@ function fcpV2(r15,r3,tAvg,tMax,tMin,hum,wind,month,bt,altStr,esp,soilMoist,rain
 }
 
 // ── specieProb v3 — basata su scores multi-specie ─────────────────
-function specieProb(bt,month,altLow,r15,r3,tAvg,tMax,tMin,hum,wind,soilMoist,rainLagDays,r30){
+function specieProb(bt,month,altLow,r15,r3,tAvg,tMax,tMin,hum,wind,soilMoist,rainLagDays,r30,tMin7){
   const quota=altLow||800;
   const lag=rainLagDays!=null?rainLagDays:8;
   const rr30=(r30!=null&&!isNaN(r30))?r30:((r15||30)*1.6);
   const scores={
-    edulis:     fcpScoreSpecie("edulis",    r15||30,r3||5,tAvg||14,tMax||18,tMin||9,hum||70,wind||10,soilMoist,lag,bt,quota,month,"M",rr30),
-    pinophilus: fcpScoreSpecie("pinophilus",r15||30,r3||5,tAvg||14,tMax||18,tMin||9,hum||70,wind||10,soilMoist,lag,bt,quota,month,"M",rr30),
-    aestivalis: fcpScoreSpecie("aestivalis",r15||30,r3||5,tAvg||14,tMax||18,tMin||9,hum||70,wind||10,soilMoist,lag,bt,quota,month,"M",rr30),
-    aereus:     fcpScoreSpecie("aereus",    r15||30,r3||5,tAvg||14,tMax||18,tMin||9,hum||70,wind||10,soilMoist,lag,bt,quota,month,"M",rr30),
+    edulis:     fcpScoreSpecie("edulis",    r15||30,r3||5,tAvg||14,tMax||18,tMin||9,hum||70,wind||10,soilMoist,lag,bt,quota,month,"M",rr30,tMin7),
+    pinophilus: fcpScoreSpecie("pinophilus",r15||30,r3||5,tAvg||14,tMax||18,tMin||9,hum||70,wind||10,soilMoist,lag,bt,quota,month,"M",rr30,tMin7),
+    aestivalis: fcpScoreSpecie("aestivalis",r15||30,r3||5,tAvg||14,tMax||18,tMin||9,hum||70,wind||10,soilMoist,lag,bt,quota,month,"M",rr30,tMin7),
+    aereus:     fcpScoreSpecie("aereus",    r15||30,r3||5,tAvg||14,tMax||18,tMin||9,hum||70,wind||10,soilMoist,lag,bt,quota,month,"M",rr30,tMin7),
   };
   const maxSp=Object.entries(scores).sort((a,b)=>b[1]-a[1])[0];
   const maxScore=maxSp[1];
@@ -1471,7 +1508,7 @@ async function loadAll(){
 
   zonesData = results.map((res,i)=>{
     const z=ZONES[i];
-    let r15=45,r3=6,tAvg=14,tMax=19,tMin=9,hum=68,wind=15,soilMoist=null,rainLagDays=8,r30=80,excessWater=0,coldDaysBelow4=0,coldDaysBelow0=0;
+    let r15=45,r3=6,tAvg=14,tMax=19,tMin=9,hum=68,wind=15,soilMoist=null,rainLagDays=8,r30=80,excessWater=0,coldDaysBelow4=0,coldDaysBelow0=0,tMin7=null;
     let hist=Array.from({length:15},()=>Math.round(30+Math.random()*35));
     // prec definito SEMPRE — usato anche nel ramo else per fallback
     let prec=Array(15).fill(0);
@@ -1495,6 +1532,8 @@ async function loadAll(){
         tAvg=tM.filter(v=>v!=null).length?avg(tM.filter(v=>v!=null)):14;
         tMax=tX.filter(v=>v!=null).length?avg(tX.filter(v=>v!=null)):tAvg+4;
         tMin=tN.filter(v=>v!=null).length?avg(tN.filter(v=>v!=null)):tAvg-4;
+        // gelo: minima assoluta delle tMin degli ultimi 7 giorni
+        { const t7=tN.slice(-7).filter(v=>v!=null); tMin7=t7.length?Math.min(...t7):null; }
         hum=hu.filter(v=>v!=null).length?avg(hu.filter(v=>v!=null)):68;
         wind=wi.filter(v=>v!=null).length?Math.max(...wi.filter(v=>v!=null)):15;
         // v2.1 — Umidità suolo: media ultimi 7 giorni a mezzogiorno
@@ -1533,14 +1572,19 @@ async function loadAll(){
           const win30  = allPrec.slice(Math.max(0,endIdx-30), endIdx);
           const r30day = win30.reduce((a,b)=>a+(b||0),0);
           return fcpV2(sub.reduce((a,b)=>a+(b||0),0),sub.slice(-3).reduce((a,b)=>a+(b||0),0),
-            tM[idx]||tAvg,tX[idx]||tMax,tN[idx]||tMin,hu[idx]||hum,wi[idx]||15,month,z.bt,z.alt,z.esp,soilMoist,lagIdx,r30day).total;
+            tM[idx]||tAvg,tX[idx]||tMax,tN[idx]||tMin,hu[idx]||hum,wi[idx]||15,month,z.bt,z.alt,z.esp,soilMoist,lagIdx,r30day,
+            (()=>{ const w=tN.slice(Math.max(0,idx-6),idx+1).filter(v=>v!=null); return w.length?Math.min(...w):tMin7; })()).total;
         });
       } catch(e){ console.warn("Errore parsing zona",z.name,e); errCount++; }
     } else errCount++;
 
-    const {total,bd_scores,scores,wrf}=fcpV2(r15,r3,tAvg,tMax,tMin,hum,wind,month,z.bt,z.alt,z.esp,soilMoist,rainLagDays,r30);
-    const sp=specieProb(z.bt,month,parseInt(z.alt)||800,r15,r3,tAvg,tMax,tMin,hum,wind,soilMoist,rainLagDays,r30);
-    return {...z,idx:total,bd:bd_scores,specieProb:sp,r15:Math.round(r15),r3:Math.round(r3),
+    const {total,bd_scores,scores,wrf,src,dbg}=fcpV2(r15,r3,tAvg,tMax,tMin,hum,wind,month,z.bt,z.alt,z.esp,soilMoist,rainLagDays,r30,tMin7);
+    const sp=specieProb(z.bt,month,parseInt(z.alt)||800,r15,r3,tAvg,tMax,tMin,hum,wind,soilMoist,rainLagDays,r30,tMin7);
+    // scomposizione per zona (specie che guida l'indice) — per verificare/rifinire i numeri
+    { const d=(dbg&&dbg[src])||{};
+      console.log('[fcp]',{zona:z.name, specie:src, alt:z.alt, mese:month, base:d.base, frostFactor:d.frostFactor, dryGate:d.dryGate,
+        lateSeasonAlt:d.lateSeasonAlt, flushPast:d.flushPast, rainLag:d.rlf, final:total, tMin7:d.tMin7, r15:d.r15}); }
+    return {...z,idx:total,idxSrc:src,tMin7:(tMin7!=null?Math.round(tMin7*10)/10:null),bd:bd_scores,specieProb:sp,r15:Math.round(r15),r3:Math.round(r3),
       tAvg:Math.round(tAvg*10)/10,tMax:Math.round(tMax*10)/10,tMin:Math.round(tMin*10)/10,
       dT:Math.round((tMax-tMin)*10)/10,hum:Math.round(hum),wind:Math.round(wind),history:hist,
       precDays:prec.map(v=>Math.round((v||0)*10)/10),
