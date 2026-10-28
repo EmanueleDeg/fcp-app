@@ -1149,6 +1149,15 @@ const SPECIE_DB = {
     }
   }
 };
+// Mese corrente → valore remoto (se c'è); altri mesi (trend) → locale. _local resta per confronto/fallback.
+Object.keys(SPECIE_DB).forEach(id=>{
+  const sp=SPECIE_DB[id], local=sp.scoreZona;
+  sp._local=local;
+  sp.scoreZona=(z,month)=>{
+    if(month===new Date().getMonth()+1){ const r=remoteScore(z,id); if(r!=null) return r; }
+    return local(z,month);
+  };
+});
 let selectedSpecie='edulis';
 
 // ── trendOf per specie ───────────────────────────────────────────
@@ -1157,7 +1166,8 @@ function trendOfSpecie(score,z,sp){
   const month=new Date().getMonth()+1;
   const next=month===12?1:month+1;
   const scoreNext=sp.scoreZona({...z,idx:z.idx},next);
-  const delta=scoreNext-score;
+  const scoreNowLocal=(sp._local||sp.scoreZona)(z,month);
+  const delta=scoreNext-scoreNowLocal;   // entrambi locali: il trend non mescola motore remoto e locale
   if(delta>=8)  return {label:"↑ In crescita",cls:"trend-up"};
   if(delta<=-8) return {label:"↓ In calo",cls:"trend-dn"};
   return {label:"→ Stabile",cls:"trend-st"};
@@ -1483,6 +1493,49 @@ function seasonLabel(m, d){
   return "❄️ Fuori Stagione";
 }
 
+// ── Motore unico indice (Edge Function growth-index) ──────────────
+// Fonte di verità dell'indice: stessi valori dell'app. Il calcolo locale resta come fallback
+// e come termine di confronto (log [fcp-cmp]) finché non si decide di rimuoverlo.
+const GROWTH_URL='https://pqrdhqvtsirmdtzpkwbh.supabase.co/functions/v1/growth-index';
+const GROWTH_KEY='eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InBxcmRocXZ0c2lybWR0enBrd2JoIiwicm9sZSI6ImFub24iLCJpYXQiOjE3NzUyNTE2MDMsImV4cCI6MjA5MDgyNzYwM30.4pHVL5JaF2ifd3_g9QrV1nAA_HzyHr9u-i-wvl-hJes';
+const GROWTH_CACHE_KEY='fcp_growth_cache_v1';
+const SITE_SPECIES=['edulis','pinophilus','aestivalis','aereus'];
+async function fetchRemoteGrowth(zones){
+  const body={locations:zones.map(z=>({lat:z.lat,lon:z.lon,bt:z.bt,alt:z.alt,esp:z.esp,name:z.name}))};
+  const ctrl=new AbortController();
+  const tid=setTimeout(()=>ctrl.abort(),4000);
+  try{
+    const r=await fetch(GROWTH_URL,{method:'POST',signal:ctrl.signal,
+      headers:{'content-type':'application/json','apikey':GROWTH_KEY,'Authorization':'Bearer '+GROWTH_KEY},
+      body:JSON.stringify(body)});
+    if(!r.ok) throw new Error('HTTP '+r.status);
+    const d=await r.json();
+    if(!d.results||d.results.length!==zones.length) throw new Error('risposta incoerente');
+    try{ localStorage.setItem(GROWTH_CACHE_KEY,JSON.stringify({day:new Date().toDateString(),results:d.results.map(x=>({idx:x.idx,perSpecie:x.perSpecie,algoVersion:x.algoVersion}))})); }catch(e){}
+    return d.results;
+  }catch(e){
+    console.warn('[fcp] growth-index non disponibile, uso cache/locale:',e);
+    try{ // ultimo valore valido (stesso giorno, stesso numero di zone)
+      const c=JSON.parse(localStorage.getItem(GROWTH_CACHE_KEY)||'null');
+      if(c&&c.day===new Date().toDateString()&&c.results.length===zones.length) return c.results;
+    }catch(e2){}
+    return null;
+  }finally{ clearTimeout(tid); }
+}
+// Punteggio remoto per specie (mese corrente); null se non disponibile
+function remoteScore(z,spId){
+  const p=z&&z.remote&&z.remote.perSpecie&&z.remote.perSpecie.find(x=>x.id===spId);
+  return p?p.score:null;
+}
+// Indice "zona" mostrato nel dettaglio/mappa: migliore tra le 4 specie del sito
+function idxShown(z){
+  if(z&&z.remote&&z.remote.perSpecie){
+    const v=z.remote.perSpecie.filter(x=>SITE_SPECIES.includes(x.id)).map(x=>x.score);
+    if(v.length) return Math.max(...v);
+  }
+  return z.idx;
+}
+
 let zonesData=[], currentFilter='tutti', currentRegion='tutte', selectedIdx=-1, mapInstance=null;
 
 async function fetchWithTimeout(url, ms=8000){
@@ -1601,7 +1654,17 @@ async function loadAll(){
   });
 
   if(errCount>0) document.getElementById("errBar").style.display="block";
-  zonesData.sort((a,b)=>b.idx-a.idx);
+  // Motore unico: UNA chiamata batch per tutte le zone (z.remote), con log di confronto vecchio↔nuovo
+  const remote=await fetchRemoteGrowth(zonesData);
+  if(remote){
+    zonesData.forEach((z,i)=>{ z.remote=remote[i]; });
+    console.log('[fcp-cmp] zona | specie | vecchio(locale) | nuovo(remoto)');
+    zonesData.forEach(z=>{
+      const row=SITE_SPECIES.map(id=>id+' '+SPECIE_DB[id]._local(z,month)+'→'+remoteScore(z,id)).join(' | ');
+      console.log('[fcp-cmp]',z.name,'|',row);
+    });
+  }
+  zonesData.sort((a,b)=>idxShown(b)-idxShown(a));
 
   // Applica il filtro ?area= PRIMA del render — così mostra solo le zone corrette
   filterByAreaParam();
@@ -1771,7 +1834,7 @@ function sortBy(k){
 
 function openDetail(i){
   selectedIdx=i;
-  const z=zonesData[i],s=statusOf(z.idx),t=trendOf(z.history);
+  const z=zonesData[i],s=statusOf(idxShown(z)),t=trendOf(z.history);
   document.getElementById("dpName").textContent=z.name;
   document.getElementById("dpMeta").textContent=`${z.region} · ${z.alt} · ${z.bosco}`;
   const sp = z.specieProb || {specie:"B. edulis",conf:"Media"};
@@ -1789,12 +1852,12 @@ function openDetail(i){
     ? `<p style="margin-top:6px;font-size:.75rem;background:rgba(221,179,71,.08);border:1px solid rgba(221,179,71,.2);border-radius:4px;padding:6px 10px;color:var(--yellow)">🌱 <strong>Stagione parziale</strong> — probabilità ridotta. Condizioni meteo da monitorare in attesa della stagione.</p>`
     : "";
   document.getElementById("dpScoreBig").innerHTML=`
-    <div class="dp-score-num" style="color:${s.color}">${z.idx}</div>
+    <div class="dp-score-num" style="color:${s.color}">${idxShown(z)}</div>
     <div class="dp-score-info">
       <h4>${s.dot} Potenziale ${s.label} per Porcini</h4>
       <p style="margin-top:4px">${t.label} — ${z.bosco} · ${z.alt}</p>
       ${z.scores?`<div style="display:flex;gap:8px;margin-top:8px;flex-wrap:wrap;">
-        ${Object.entries(z.scores).map(([sp,sc])=>`<span style="font-size:.72rem;padding:2px 8px;border-radius:3px;background:${sc>=50?'rgba(74,124,40,.15)':sc>=25?'rgba(221,179,71,.1)':'rgba(201,79,53,.08)'};color:${sc>=50?'var(--green2)':sc>=25?'var(--yellow)':'var(--text3)'};border:1px solid ${sc>=50?'rgba(74,124,40,.25)':sc>=25?'rgba(221,179,71,.2)':'rgba(201,79,53,.15)'}">B. ${sp} ${sc}</span>`).join('')}
+        ${Object.entries(z.scores).map(([sp,sc0])=>{const sc=(remoteScore(z,sp)!=null?remoteScore(z,sp):sc0);return `<span style="font-size:.72rem;padding:2px 8px;border-radius:3px;background:${sc>=50?'rgba(74,124,40,.15)':sc>=25?'rgba(221,179,71,.1)':'rgba(201,79,53,.08)'};color:${sc>=50?'var(--green2)':sc>=25?'var(--yellow)':'var(--text3)'};border:1px solid ${sc>=50?'rgba(74,124,40,.25)':sc>=25?'rgba(221,179,71,.2)':'rgba(201,79,53,.15)'}">B. ${sp} ${sc}</span>`;}).join('')}
       </div>`:''}
       ${!fuoriStagione && sp.conf!=="—" ? `<p style="margin-top:6px">🍄 <strong style="color:${confColor}">Specie probabile:</strong> <span style="color:var(--text)">${sp.specie}</span> <span style="font-size:.72rem;color:var(--text3)">(confidenza: ${sp.conf})</span></p>` : ""}
       ${stagioneWarning}
@@ -1848,11 +1911,11 @@ function initMap(){
   mapInstance=L.map('map',{center:[45.7,10.2],zoom:7});
   L.tileLayer('https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}{r}.png',{attribution:'© OpenStreetMap © CARTO',maxZoom:18}).addTo(mapInstance);
   zonesData.forEach(z=>{
-    const col=z.idx>=65?"#6db33f":z.idx>=35?"#ddb347":"#c94f35";
+    const zi=idxShown(z);const col=zi>=65?"#6db33f":zi>=35?"#ddb347":"#c94f35";
     const t=trendOf(z.history);
-    L.circleMarker([z.lat,z.lon],{radius:10+z.idx/100*16,fillColor:col,color:col,weight:2,opacity:.9,fillOpacity:.55})
+    L.circleMarker([z.lat,z.lon],{radius:10+zi/100*16,fillColor:col,color:col,weight:2,opacity:.9,fillOpacity:.55})
       .addTo(mapInstance)
-      .bindPopup(`<div class="popup-name">${z.name}</div><div style="font-size:.72rem;color:#8fa87d;margin-bottom:6px">${z.region} · ${z.alt}</div><div class="popup-idx" style="color:${col}">${z.idx}<span style="font-size:1rem;color:#516046">/100</span></div><div class="popup-row">${statusOf(z.idx).dot} Potenziale ${statusOf(z.idx).label}</div><div class="popup-row">${t.label}</div><div class="popup-row" style="margin-top:4px;color:#627055">${z.bosco}</div>`,{maxWidth:200});
+      .bindPopup(`<div class="popup-name">${z.name}</div><div style="font-size:.72rem;color:#8fa87d;margin-bottom:6px">${z.region} · ${z.alt}</div><div class="popup-idx" style="color:${col}">${zi}<span style="font-size:1rem;color:#516046">/100</span></div><div class="popup-row">${statusOf(zi).dot} Potenziale ${statusOf(zi).label}</div><div class="popup-row">${t.label}</div><div class="popup-row" style="margin-top:4px;color:#627055">${z.bosco}</div>`,{maxWidth:200});
   });
 }
 
